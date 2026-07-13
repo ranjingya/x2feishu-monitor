@@ -1,0 +1,20 @@
+services:
+  monitor:
+    container_name: x2feishu-monitor
+    build:
+      context: .
+    env_file:
+      - .env
+    restart: unless-stopped
+    init: true
+    volumes:
+      - monitor-data:/data
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/x2feishu-monitor", "--healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  monitor-data:
