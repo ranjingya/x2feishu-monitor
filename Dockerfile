@@ -1,6 +1,6 @@
 FROM python:3.13-slim-bookworm
 
-COPY --from=ghcr.io/astral-sh/uv:0.11.1 /uv /uvx /bin/
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ uv
 
 ENV TZ=Asia/Shanghai
 
