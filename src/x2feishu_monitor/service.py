@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from x2feishu_monitor.clients import FeishuClient, XClient
 from x2feishu_monitor.config import Settings
 from x2feishu_monitor.models import Post
 from x2feishu_monitor.state import StateStore
+from x2feishu_monitor.translation import TranslationClient, TranslationError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,26 +31,132 @@ def _format_created_at(raw_value: str | None, utc_offset: str) -> str | None:
         return raw_value
 
 
-def format_post_message(post: Post, settings: Settings) -> str:
-    """生成飞书文本消息。
+def _escape_lark_markdown(text: str) -> str:
+    """转义帖子正文中的飞书 Markdown 控制字符。"""
+    escaped = text.replace("\\", "\\\\")
+    for character in ("`", "*", "_", "~", "[", "]"):
+        escaped = escaped.replace(character, f"\\{character}")
+    return escaped
 
-    功能说明：组合安全关键词、作者、正文、时间与原文链接，并限制总长度。
-    参数 post：需要推送的 X 帖子。
-    参数 settings：包含用户名、关键词、时区和长度限制的运行配置。
-    返回值：可直接提交给飞书 Webhook 的文本内容。
-    """
-    header = f"【{settings.feishu_keyword}】@{settings.x_username} 发布了新帖子\n\n"
+
+def _truncate_card_text(text: str, maximum_length: int, post_id: str) -> str:
+    """按卡片内容预算截断文本。"""
+    if len(text) <= maximum_length:
+        return text
+    LOGGER.warning("帖子卡片内容超过飞书消息上限，已截断：post_id=%s", post_id)
+    return f"{text[: maximum_length - 1]}…"
+
+
+def build_post_card(
+    post: Post,
+    settings: Settings,
+    translation: str | None = None,
+    translation_failed: bool = False,
+) -> dict[str, Any]:
+    """生成包含原文、译文和原文按钮的飞书交互式卡片。"""
+    section_count = 2 if translation is not None or translation_failed else 1
+    available_length = settings.feishu_message_max_length - 300
+    if available_length < 100:
+        raise ValueError("FEISHU_MESSAGE_MAX_LENGTH 过小，无法容纳卡片固定内容")
+    section_length = max(50, available_length // section_count)
+
+    original_text = _truncate_card_text(
+        _escape_lark_markdown(post.text), section_length, post.id
+    )
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": f"**原文**\n{original_text}",
+            },
+        }
+    ]
+
+    if translation is not None or translation_failed:
+        if translation is not None:
+            translated_text = _truncate_card_text(
+                _escape_lark_markdown(translation), section_length, post.id
+            )
+        else:
+            translated_text = "翻译服务暂时不可用，本次仅推送原文。"
+        elements.extend(
+            [
+                {"tag": "hr"},
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": (
+                            f"**{settings.translation_target_language}译文**\n"
+                            f"{translated_text}"
+                        ),
+                    },
+                },
+            ]
+        )
+
     created_at = _format_created_at(post.created_at, settings.display_utc_offset)
-    time_line = f"\n\n发布时间：{created_at}" if created_at else ""
-    footer = f"{time_line}\n原文：https://x.com/{settings.x_username}/status/{post.id}"
-    available_length = settings.feishu_message_max_length - len(header) - len(footer)
-    if available_length <= 1:
-        raise ValueError("FEISHU_MESSAGE_MAX_LENGTH 过小，无法容纳消息固定内容")
-    body = post.text
-    if len(body) > available_length:
-        body = f"{body[: available_length - 1]}…"
-        LOGGER.warning("帖子正文超过飞书消息上限，已截断：post_id=%s", post.id)
-    return f"{header}{body}{footer}"
+    if created_at:
+        elements.append(
+            {
+                "tag": "note",
+                "elements": [
+                    {"tag": "plain_text", "content": f"发布时间：{created_at}"}
+                ],
+            }
+        )
+
+    post_url = f"https://x.com/{settings.x_username}/status/{post.id}"
+    elements.append(
+        {
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "button",
+                    "type": "primary",
+                    "text": {"tag": "plain_text", "content": "查看 X 原文"},
+                    "url": post_url,
+                }
+            ],
+        }
+    )
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {
+                "tag": "plain_text",
+                "content": (
+                    f"【{settings.feishu_keyword}】@{settings.x_username} 发布了新帖子"
+                ),
+            },
+        },
+        "elements": elements,
+    }
+
+
+def build_test_card(settings: Settings) -> dict[str, Any]:
+    """生成用于验证飞书 Webhook 的测试卡片。"""
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "green",
+            "title": {
+                "tag": "plain_text",
+                "content": f"【{settings.feishu_keyword}】连接测试成功",
+            },
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": "X2Feishu Monitor 已成功连接飞书机器人。",
+                },
+            }
+        ],
+    }
 
 
 class MonitorService:
@@ -60,6 +168,7 @@ class MonitorService:
         x_client: XClient,
         feishu_client: FeishuClient,
         state_store: StateStore,
+        translation_client: TranslationClient | None = None,
     ) -> None:
         """初始化监控服务。
 
@@ -68,12 +177,14 @@ class MonitorService:
         参数 x_client：X API 客户端。
         参数 feishu_client：飞书 Webhook 客户端。
         参数 state_store：SQLite 状态存储。
+        参数 translation_client：可选的帖子翻译客户端。
         返回值：无。
         """
         self.settings = settings
         self.x_client = x_client
         self.feishu_client = feishu_client
         self.state_store = state_store
+        self.translation_client = translation_client
 
     def initialize(self) -> None:
         """建立首次运行基线。
@@ -129,9 +240,33 @@ class MonitorService:
         pushed_count = 0
         for post in ordered_posts:
             LOGGER.info("开始处理新帖子：post_id=%s", post.id)
-            message = format_post_message(post, self.settings)
-            self.feishu_client.send_text(message)
+            translation: str | None = None
+            translation_failed = False
+            translation_cache_key = f"translation:{post.id}"
+            if self.translation_client is not None:
+                translation = self.state_store.get(translation_cache_key)
+                if translation is None:
+                    try:
+                        translation = self.translation_client.translate(post.text)
+                        if translation:
+                            self.state_store.set(translation_cache_key, translation)
+                    except TranslationError as exc:
+                        translation_failed = True
+                        LOGGER.warning(
+                            "帖子翻译失败，将仅推送原文：post_id=%s, error=%s",
+                            post.id,
+                            exc,
+                        )
+
+            card = build_post_card(
+                post,
+                self.settings,
+                translation=translation,
+                translation_failed=translation_failed,
+            )
+            self.feishu_client.send_card(card)
             self.state_store.set("last_seen_id", post.id)
+            self.state_store.delete(translation_cache_key)
             pushed_count += 1
             LOGGER.info("新帖子处理完成：post_id=%s", post.id)
 

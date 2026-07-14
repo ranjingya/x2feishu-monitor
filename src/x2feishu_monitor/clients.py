@@ -23,7 +23,9 @@ class ExternalServiceError(RuntimeError):
 class XClient:
     """读取指定 X 用户帖子。"""
 
-    def __init__(self, settings: Settings, session: requests.Session | None = None) -> None:
+    def __init__(
+        self, settings: Settings, session: requests.Session | None = None
+    ) -> None:
         """初始化 X API 客户端。
 
         功能说明：配置认证信息、读取参数和仅用于 GET 请求的安全重试策略。
@@ -159,9 +161,11 @@ class XClient:
 
 
 class FeishuClient:
-    """通过飞书群自定义机器人发送文本消息。"""
+    """通过飞书群自定义机器人发送消息。"""
 
-    def __init__(self, settings: Settings, session: requests.Session | None = None) -> None:
+    def __init__(
+        self, settings: Settings, session: requests.Session | None = None
+    ) -> None:
         """初始化飞书客户端。
 
         功能说明：保存 Webhook、超时和会话配置；POST 请求不自动重试以降低重复消息风险。
@@ -174,17 +178,25 @@ class FeishuClient:
         self.session.headers.update({"User-Agent": "x2feishu-monitor/0.1"})
 
     def send_text(self, text: str) -> None:
-        """向飞书群发送文本消息。
+        """向飞书群发送普通文本消息。"""
+        self._send_payload({"msg_type": "text", "content": {"text": text}})
+
+    def send_card(self, card: dict[str, Any]) -> None:
+        """向飞书群发送交互式卡片消息。"""
+        self._send_payload({"msg_type": "interactive", "card": card})
+
+    def _send_payload(self, payload: dict[str, Any]) -> None:
+        """提交 Webhook 消息并校验 HTTP 与业务响应码。
 
         功能说明：调用自定义机器人 Webhook，并同时校验 HTTP 与业务响应码。
-        参数 text：需要发送的完整文本消息。
+        参数 payload：符合飞书机器人格式的完整消息对象。
         返回值：无；发送失败时抛出 ExternalServiceError。
         """
         LOGGER.info("开始向飞书推送消息")
         try:
             response = self.session.post(
                 self.settings.feishu_webhook_url,
-                json={"msg_type": "text", "content": {"text": text}},
+                json=payload,
                 timeout=self.settings.request_timeout_seconds,
             )
         except requests.RequestException as exc:
@@ -205,5 +217,7 @@ class FeishuClient:
         code = payload.get("code", payload.get("StatusCode"))
         if code != 0:
             message = payload.get("msg", payload.get("StatusMessage", "未知错误"))
-            raise ExternalServiceError(f"飞书 Webhook 发送失败：code={code}, message={message}")
+            raise ExternalServiceError(
+                f"飞书 Webhook 发送失败：code={code}, message={message}"
+            )
         LOGGER.info("飞书消息推送成功")

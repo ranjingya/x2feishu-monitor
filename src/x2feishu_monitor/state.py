@@ -61,6 +61,12 @@ class StateStore:
                     (key, value, updated_at),
                 )
 
+    def delete(self, key: str) -> None:
+        """删除不再需要的状态值。"""
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute("DELETE FROM monitor_state WHERE key = ?", (key,))
+
     def touch_heartbeat(self) -> None:
         """记录主循环最近一次完成时间。"""
         self.set("heartbeat_at", datetime.now(UTC).isoformat())

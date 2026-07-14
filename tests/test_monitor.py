@@ -7,26 +7,30 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from x2feishu_monitor.clients import FeishuClient, XClient
+from x2feishu_monitor.clients import ExternalServiceError, FeishuClient, XClient
 from x2feishu_monitor.config import ConfigError, Settings
 from x2feishu_monitor.models import Post
-from x2feishu_monitor.service import MonitorService, format_post_message
+from x2feishu_monitor.service import MonitorService, build_post_card
 from x2feishu_monitor.state import StateStore
+from x2feishu_monitor.translation import TranslationClient, TranslationError
 
 
-def make_settings(database_path: Path) -> Settings:
+def make_settings(
+    database_path: Path, extra_values: dict[str, str] | None = None
+) -> Settings:
     """创建不包含真实密钥的测试配置。"""
-    return Settings.from_env(
-        {
-            "X_BEARER_TOKEN": "test-token",
-            "X_USER_ID": "123456789",
-            "X_USERNAME": "example_user",
-            "FEISHU_WEBHOOK_URL": "https://open.feishu.cn/open-apis/bot/v2/hook/test",
-            "FEISHU_KEYWORD": "X 更新",
-            "STATE_DB_PATH": str(database_path),
-            "POLL_INTERVAL_SECONDS": "300",
-        }
-    )
+    values = {
+        "X_BEARER_TOKEN": "test-token",
+        "X_USER_ID": "123456789",
+        "X_USERNAME": "example_user",
+        "FEISHU_WEBHOOK_URL": "https://open.feishu.cn/open-apis/bot/v2/hook/test",
+        "FEISHU_KEYWORD": "X 更新",
+        "STATE_DB_PATH": str(database_path),
+        "POLL_INTERVAL_SECONDS": "300",
+    }
+    if extra_values:
+        values.update(extra_values)
+    return Settings.from_env(values)
 
 
 class FakeResponse:
@@ -84,14 +88,36 @@ class FakeXClient:
 
 
 class FakeFeishuClient:
-    """记录业务流程生成的飞书消息。"""
+    """记录业务流程生成的飞书卡片。"""
 
-    def __init__(self) -> None:
-        self.messages: list[str] = []
+    def __init__(self, failures_remaining: int = 0) -> None:
+        self.cards: list[dict[str, Any]] = []
+        self.failures_remaining = failures_remaining
 
-    def send_text(self, text: str) -> None:
-        """记录文本消息。"""
-        self.messages.append(text)
+    def send_card(self, card: dict[str, Any]) -> None:
+        """记录卡片，或按预设次数模拟发送失败。"""
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise ExternalServiceError("模拟飞书发送失败")
+        self.cards.append(card)
+
+
+class FakeTranslationClient:
+    """记录翻译调用并返回预设译文。"""
+
+    def __init__(
+        self, translation: str = "中文译文", should_fail: bool = False
+    ) -> None:
+        self.translation = translation
+        self.should_fail = should_fail
+        self.calls: list[str] = []
+
+    def translate(self, text: str) -> str:
+        """返回译文或模拟翻译失败。"""
+        self.calls.append(text)
+        if self.should_fail:
+            raise TranslationError("模拟翻译失败")
+        return self.translation
 
 
 class ConfigTests(unittest.TestCase):
@@ -101,6 +127,15 @@ class ConfigTests(unittest.TestCase):
         """缺少密钥时应明确失败。"""
         with self.assertRaises(ConfigError):
             Settings.from_env({})
+
+    def test_translation_requires_api_url_and_model(self) -> None:
+        """启用翻译但缺少接口配置时应明确失败。"""
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ConfigError):
+                make_settings(
+                    Path(directory) / "state.db",
+                    {"TRANSLATION_ENABLED": "true"},
+                )
 
 
 class ClientTests(unittest.TestCase):
@@ -118,7 +153,9 @@ class ClientTests(unittest.TestCase):
                             "meta": {"next_token": "next-page"},
                         }
                     ),
-                    FakeResponse({"data": [{"id": "101", "text": "新帖一"}], "meta": {}}),
+                    FakeResponse(
+                        {"data": [{"id": "101", "text": "新帖一"}], "meta": {}}
+                    ),
                 ]
             )
             posts = XClient(settings, session=session).fetch_posts("100")
@@ -128,15 +165,45 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(session.calls[1][2]["params"]["pagination_token"], "next-page")
         self.assertEqual(session.calls[0][2]["params"]["exclude"], "replies,retweets")
 
-    def test_feishu_client_accepts_v2_success_response(self) -> None:
-        """飞书 V2 成功响应应被识别。"""
+    def test_feishu_client_sends_interactive_card(self) -> None:
+        """飞书卡片应使用 interactive 消息类型。"""
         with tempfile.TemporaryDirectory() as directory:
             settings = make_settings(Path(directory) / "state.db")
-            session = FakeSession([FakeResponse({"StatusCode": 0, "StatusMessage": "success"})])
-            FeishuClient(settings, session=session).send_text("【X 更新】测试")
+            session = FakeSession(
+                [FakeResponse({"StatusCode": 0, "StatusMessage": "success"})]
+            )
+            card = {"header": {"title": {"tag": "plain_text", "content": "测试"}}}
+            FeishuClient(settings, session=session).send_card(card)
 
         self.assertEqual(session.calls[0][0], "POST")
-        self.assertEqual(session.calls[0][2]["json"]["msg_type"], "text")
+        self.assertEqual(session.calls[0][2]["json"]["msg_type"], "interactive")
+        self.assertEqual(session.calls[0][2]["json"]["card"], card)
+
+    def test_translation_client_uses_chat_completions_format(self) -> None:
+        """翻译客户端应提交模型和正文并提取译文。"""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = make_settings(
+                Path(directory) / "state.db",
+                {
+                    "TRANSLATION_ENABLED": "true",
+                    "TRANSLATION_API_URL": "https://translation.example/v1/chat/completions",
+                    "TRANSLATION_API_KEY": "translation-key",
+                    "TRANSLATION_MODEL": "translation-model",
+                    "TRANSLATION_TARGET_LANGUAGE": "简体中文",
+                },
+            )
+            session = FakeSession(
+                [FakeResponse({"choices": [{"message": {"content": "你好世界"}}]})]
+            )
+            translated = TranslationClient(settings, session=session).translate(
+                "Hello world"
+            )
+
+        self.assertEqual(translated, "你好世界")
+        request_json = session.calls[0][2]["json"]
+        self.assertEqual(request_json["model"], "translation-model")
+        self.assertEqual(request_json["messages"][1]["content"], "Hello world")
+        self.assertEqual(session.headers["Authorization"], "Bearer translation-key")
 
     def test_x_client_can_read_only_latest_page_for_baseline(self) -> None:
         """初始化基线时应允许忽略历史分页令牌。"""
@@ -162,6 +229,24 @@ class ClientTests(unittest.TestCase):
         self.assertEqual([post.id for post in posts], ["102"])
         self.assertEqual(session.calls[0][2]["params"]["max_results"], 5)
 
+    def test_x_client_can_include_user_replies(self) -> None:
+        """启用回复后不应向 X API 传递 replies 排除项。"""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = make_settings(
+                Path(directory) / "state.db", {"X_INCLUDE_REPLIES": "true"}
+            )
+            session = FakeSession(
+                [
+                    FakeResponse(
+                        {"data": [{"id": "101", "text": "回复内容"}], "meta": {}}
+                    )
+                ]
+            )
+            posts = XClient(settings, session=session).fetch_posts("100")
+
+        self.assertEqual([post.id for post in posts], ["101"])
+        self.assertEqual(session.calls[0][2]["params"]["exclude"], "retweets")
+
 
 class ServiceTests(unittest.TestCase):
     """监控主流程测试。"""
@@ -172,7 +257,12 @@ class ServiceTests(unittest.TestCase):
             settings = make_settings(Path(directory) / "state.db")
             state = StateStore(settings.state_db_path)
             x_client = FakeXClient(
-                [[Post(id="102", text="较新", created_at=None), Post(id="101", text="较旧", created_at=None)]]
+                [
+                    [
+                        Post(id="102", text="较新", created_at=None),
+                        Post(id="101", text="较旧", created_at=None),
+                    ]
+                ]
             )
             feishu_client = FakeFeishuClient()
             service = MonitorService(settings, x_client, feishu_client, state)  # type: ignore[arg-type]
@@ -181,7 +271,7 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual(pushed_count, 0)
             self.assertEqual(state.get("last_seen_id"), "102")
-            self.assertEqual(feishu_client.messages, [])
+            self.assertEqual(feishu_client.cards, [])
 
     def test_new_posts_are_pushed_oldest_first_and_cursor_advances(self) -> None:
         """新增帖子应从旧到新推送并保存最终游标。"""
@@ -191,7 +281,12 @@ class ServiceTests(unittest.TestCase):
             state.set("initialized", "1")
             state.set("last_seen_id", "100")
             x_client = FakeXClient(
-                [[Post(id="102", text="新帖二", created_at=None), Post(id="101", text="新帖一", created_at=None)]]
+                [
+                    [
+                        Post(id="102", text="新帖二", created_at=None),
+                        Post(id="101", text="新帖一", created_at=None),
+                    ]
+                ]
             )
             feishu_client = FakeFeishuClient()
             service = MonitorService(settings, x_client, feishu_client, state)  # type: ignore[arg-type]
@@ -199,21 +294,93 @@ class ServiceTests(unittest.TestCase):
             pushed_count = service.run_cycle()
 
             self.assertEqual(pushed_count, 2)
-            self.assertIn("status/101", feishu_client.messages[0])
-            self.assertIn("status/102", feishu_client.messages[1])
+            self.assertIn("status/101", str(feishu_client.cards[0]))
+            self.assertIn("status/102", str(feishu_client.cards[1]))
             self.assertEqual(state.get("last_seen_id"), "102")
 
-    def test_message_contains_keyword_and_link(self) -> None:
-        """飞书消息应包含安全关键词和原文地址。"""
+    def test_card_contains_keyword_translation_and_link(self) -> None:
+        """飞书卡片应包含安全关键词、译文和原文地址。"""
         with tempfile.TemporaryDirectory() as directory:
             settings = make_settings(Path(directory) / "state.db")
-            message = format_post_message(
-                Post(id="123", text="正文", created_at="2026-07-13T02:33:19Z"), settings
+            card = build_post_card(
+                Post(id="123", text="Original", created_at="2026-07-13T02:33:19Z"),
+                settings,
+                translation="中文译文",
             )
 
-        self.assertIn("X 更新", message)
-        self.assertIn("@example_user", message)
-        self.assertIn("https://x.com/example_user/status/123", message)
+        card_text = str(card)
+        self.assertIn("X 更新", card_text)
+        self.assertIn("@example_user", card_text)
+        self.assertIn("中文译文", card_text)
+        self.assertIn("https://x.com/example_user/status/123", card_text)
+
+    def test_translation_failure_still_pushes_original_and_advances_cursor(
+        self,
+    ) -> None:
+        """翻译失败不应阻塞原文卡片和游标推进。"""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = make_settings(
+                Path(directory) / "state.db",
+                {
+                    "TRANSLATION_ENABLED": "true",
+                    "TRANSLATION_API_URL": "https://translation.example/v1/chat/completions",
+                    "TRANSLATION_MODEL": "translation-model",
+                },
+            )
+            state = StateStore(settings.state_db_path)
+            state.set("initialized", "1")
+            state.set("last_seen_id", "100")
+            x_client = FakeXClient([[Post(id="101", text="Original", created_at=None)]])
+            feishu_client = FakeFeishuClient()
+            translation_client = FakeTranslationClient(should_fail=True)
+            service = MonitorService(
+                settings,
+                x_client,  # type: ignore[arg-type]
+                feishu_client,  # type: ignore[arg-type]
+                state,
+                translation_client,  # type: ignore[arg-type]
+            )
+
+            pushed_count = service.run_cycle()
+
+            self.assertEqual(pushed_count, 1)
+            self.assertEqual(state.get("last_seen_id"), "101")
+            self.assertIn("翻译服务暂时不可用", str(feishu_client.cards[0]))
+
+    def test_translation_is_cached_when_feishu_send_retries(self) -> None:
+        """飞书失败后再次处理同一帖子时应复用已生成的译文。"""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = make_settings(
+                Path(directory) / "state.db",
+                {
+                    "TRANSLATION_ENABLED": "true",
+                    "TRANSLATION_API_URL": "https://translation.example/v1/chat/completions",
+                    "TRANSLATION_MODEL": "translation-model",
+                },
+            )
+            state = StateStore(settings.state_db_path)
+            state.set("initialized", "1")
+            state.set("last_seen_id", "100")
+            post = Post(id="101", text="Original", created_at=None)
+            x_client = FakeXClient([[post], [post]])
+            feishu_client = FakeFeishuClient(failures_remaining=1)
+            translation_client = FakeTranslationClient()
+            service = MonitorService(
+                settings,
+                x_client,  # type: ignore[arg-type]
+                feishu_client,  # type: ignore[arg-type]
+                state,
+                translation_client,  # type: ignore[arg-type]
+            )
+
+            with self.assertRaises(ExternalServiceError):
+                service.run_cycle()
+            pushed_count = service.run_cycle()
+
+            self.assertEqual(pushed_count, 1)
+            self.assertEqual(translation_client.calls, ["Original"])
+            self.assertIsNone(state.get("translation:101"))
+            self.assertEqual(state.get("last_seen_id"), "101")
 
 
 if __name__ == "__main__":

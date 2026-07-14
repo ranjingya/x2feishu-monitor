@@ -36,7 +36,9 @@ def _integer(
     except ValueError as exc:
         raise ConfigError(f"{name} 必须是整数") from exc
     if value < minimum or (maximum is not None and value > maximum):
-        range_text = f"{minimum} 到 {maximum}" if maximum is not None else f"不小于 {minimum}"
+        range_text = (
+            f"{minimum} 到 {maximum}" if maximum is not None else f"不小于 {minimum}"
+        )
         raise ConfigError(f"{name} 必须位于{range_text}之间")
     return value
 
@@ -72,6 +74,12 @@ class Settings:
     initial_since_id: str | None
     feishu_message_max_length: int
     display_utc_offset: str
+    translation_enabled: bool
+    translation_api_url: str | None
+    translation_api_key: str | None
+    translation_model: str | None
+    translation_target_language: str
+    translation_timeout_seconds: int
     log_level: str
 
     @classmethod
@@ -109,6 +117,27 @@ class Settings:
         if offset_hours > 14 or (offset_hours == 14 and offset_minutes != 0):
             raise ConfigError("DISPLAY_UTC_OFFSET 必须位于 -14:00 到 +14:00 之间")
 
+        translation_enabled = _boolean(values, "TRANSLATION_ENABLED", False)
+        translation_api_url = values.get("TRANSLATION_API_URL", "").strip() or None
+        translation_model = values.get("TRANSLATION_MODEL", "").strip() or None
+        if translation_enabled:
+            if translation_api_url is None:
+                raise ConfigError("启用翻译时必须配置 TRANSLATION_API_URL")
+            parsed_translation_url = urlparse(translation_api_url)
+            if (
+                parsed_translation_url.scheme not in {"http", "https"}
+                or not parsed_translation_url.netloc
+            ):
+                raise ConfigError("TRANSLATION_API_URL 必须是有效的 HTTP 或 HTTPS 地址")
+            if translation_model is None:
+                raise ConfigError("启用翻译时必须配置 TRANSLATION_MODEL")
+
+        translation_target_language = values.get(
+            "TRANSLATION_TARGET_LANGUAGE", "简体中文"
+        ).strip()
+        if not translation_target_language:
+            raise ConfigError("TRANSLATION_TARGET_LANGUAGE 不能为空")
+
         return cls(
             x_bearer_token=_required(values, "X_BEARER_TOKEN"),
             x_user_id=user_id,
@@ -117,7 +146,9 @@ class Settings:
             feishu_keyword=_required(values, "FEISHU_KEYWORD"),
             state_db_path=Path(values.get("STATE_DB_PATH", "/data/state.db").strip()),
             poll_interval_seconds=_integer(values, "POLL_INTERVAL_SECONDS", 300, 30),
-            request_timeout_seconds=_integer(values, "REQUEST_TIMEOUT_SECONDS", 20, 1, 120),
+            request_timeout_seconds=_integer(
+                values, "REQUEST_TIMEOUT_SECONDS", 20, 1, 120
+            ),
             x_max_results=_integer(values, "X_MAX_RESULTS", 100, 5, 100),
             x_max_pages_per_poll=_integer(values, "X_MAX_PAGES_PER_POLL", 10, 1, 100),
             include_replies=_boolean(values, "X_INCLUDE_REPLIES", False),
@@ -127,5 +158,13 @@ class Settings:
                 values, "FEISHU_MESSAGE_MAX_LENGTH", 19000, 500, 30000
             ),
             display_utc_offset=display_utc_offset,
+            translation_enabled=translation_enabled,
+            translation_api_url=translation_api_url,
+            translation_api_key=values.get("TRANSLATION_API_KEY", "").strip() or None,
+            translation_model=translation_model,
+            translation_target_language=translation_target_language,
+            translation_timeout_seconds=_integer(
+                values, "TRANSLATION_TIMEOUT_SECONDS", 30, 1, 120
+            ),
             log_level=log_level,
         )

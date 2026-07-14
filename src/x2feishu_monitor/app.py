@@ -11,8 +11,9 @@ import time
 
 from x2feishu_monitor.clients import ExternalServiceError, FeishuClient, XClient
 from x2feishu_monitor.config import ConfigError, Settings
-from x2feishu_monitor.service import MonitorService
+from x2feishu_monitor.service import MonitorService, build_test_card
 from x2feishu_monitor.state import StateStore
+from x2feishu_monitor.translation import TranslationClient
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,11 +34,15 @@ def build_service(settings: Settings) -> tuple[MonitorService, StateStore]:
     返回值：MonitorService 与 StateStore 组成的元组。
     """
     state_store = StateStore(settings.state_db_path)
+    translation_client = (
+        TranslationClient(settings) if settings.translation_enabled else None
+    )
     service = MonitorService(
         settings=settings,
         x_client=XClient(settings),
         feishu_client=FeishuClient(settings),
         state_store=state_store,
+        translation_client=translation_client,
     )
     return service, state_store
 
@@ -101,8 +106,12 @@ def _build_parser() -> argparse.ArgumentParser:
     """创建命令行参数解析器。"""
     parser = argparse.ArgumentParser(description="轮询 X 用户新帖子并推送到飞书")
     parser.add_argument("--once", action="store_true", help="只执行一轮后退出")
-    parser.add_argument("--healthcheck", action="store_true", help="检查主循环心跳后退出")
-    parser.add_argument("--test-feishu", action="store_true", help="发送飞书连接测试消息后退出")
+    parser.add_argument(
+        "--healthcheck", action="store_true", help="检查主循环心跳后退出"
+    )
+    parser.add_argument(
+        "--test-feishu", action="store_true", help="发送飞书连接测试消息后退出"
+    )
     return parser
 
 
@@ -126,9 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_healthcheck(settings)
     if args.test_feishu:
         try:
-            FeishuClient(settings).send_text(
-                f"【{settings.feishu_keyword}】X2Feishu Monitor 飞书连接测试成功。"
-            )
+            FeishuClient(settings).send_card(build_test_card(settings))
             LOGGER.info("飞书连接测试完成")
             return 0
         except ExternalServiceError as exc:
