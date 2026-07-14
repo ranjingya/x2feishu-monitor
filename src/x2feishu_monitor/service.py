@@ -54,24 +54,54 @@ def build_post_card(
     translation_failed: bool = False,
 ) -> dict[str, Any]:
     """生成包含原文、译文和原文按钮的飞书交互式卡片。"""
-    section_count = 2 if translation is not None or translation_failed else 1
+    is_reply = post.reply_to_post_id is not None
+    section_count = (
+        1 + int(is_reply) + int(translation is not None or translation_failed)
+    )
     available_length = settings.feishu_message_max_length - 300
     if available_length < 100:
         raise ValueError("FEISHU_MESSAGE_MAX_LENGTH 过小，无法容纳卡片固定内容")
     section_length = max(50, available_length // section_count)
 
+    elements: list[dict[str, Any]] = []
+    if is_reply:
+        reply_target = (
+            f"@{post.reply_to_username}"
+            if post.reply_to_username
+            else post.reply_to_name or "原作者"
+        )
+        replied_to_text = (
+            post.reply_to_text or "原推文内容不可用，可通过下方按钮尝试查看。"
+        )
+        replied_to_text = _truncate_card_text(
+            _escape_lark_markdown(replied_to_text), section_length, post.id
+        )
+        elements.extend(
+            [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**被回复的推文 · {reply_target}**\n{replied_to_text}",
+                    },
+                },
+                {"tag": "hr"},
+            ]
+        )
+
     original_text = _truncate_card_text(
         _escape_lark_markdown(post.text), section_length, post.id
     )
-    elements: list[dict[str, Any]] = [
+    original_label = "回复内容" if is_reply else "原文"
+    elements.append(
         {
             "tag": "div",
             "text": {
                 "tag": "lark_md",
-                "content": f"**原文**\n{original_text}",
+                "content": f"**{original_label}**\n{original_text}",
             },
         }
-    ]
+    )
 
     if translation is not None or translation_failed:
         if translation is not None:
@@ -107,29 +137,59 @@ def build_post_card(
             }
         )
 
+    actions: list[dict[str, Any]] = []
+    if post.reply_to_post_id:
+        if post.reply_to_username:
+            replied_to_url = (
+                f"https://x.com/{post.reply_to_username}/status/{post.reply_to_post_id}"
+            )
+        else:
+            replied_to_url = f"https://x.com/i/web/status/{post.reply_to_post_id}"
+        actions.append(
+            {
+                "tag": "button",
+                "type": "default",
+                "text": {"tag": "plain_text", "content": "查看被回复推文"},
+                "url": replied_to_url,
+            }
+        )
+
     post_url = f"https://x.com/{settings.x_username}/status/{post.id}"
+    actions.append(
+        {
+            "tag": "button",
+            "type": "primary",
+            "text": {
+                "tag": "plain_text",
+                "content": "查看回复原文" if is_reply else "查看 X 原文",
+            },
+            "url": post_url,
+        }
+    )
     elements.append(
         {
             "tag": "action",
-            "actions": [
-                {
-                    "tag": "button",
-                    "type": "primary",
-                    "text": {"tag": "plain_text", "content": "查看 X 原文"},
-                    "url": post_url,
-                }
-            ],
+            "actions": actions,
         }
     )
+    if is_reply:
+        header_text = (
+            f"【{settings.feishu_keyword}】@{settings.x_username} 回复了 "
+            f"@{post.reply_to_username}"
+            if post.reply_to_username
+            else f"【{settings.feishu_keyword}】@{settings.x_username} 发布了回复"
+        )
+    else:
+        header_text = (
+            f"【{settings.feishu_keyword}】@{settings.x_username} 发布了新帖子"
+        )
     return {
         "config": {"wide_screen_mode": True},
         "header": {
             "template": "blue",
             "title": {
                 "tag": "plain_text",
-                "content": (
-                    f"【{settings.feishu_keyword}】@{settings.x_username} 发布了新帖子"
-                ),
+                "content": header_text,
             },
         },
         "elements": elements,

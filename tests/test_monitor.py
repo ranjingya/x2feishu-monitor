@@ -165,6 +165,33 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(session.calls[1][2]["params"]["pagination_token"], "next-page")
         self.assertEqual(session.calls[0][2]["params"]["exclude"], "replies,retweets")
 
+    def test_x_client_prefers_full_note_tweet_text(self) -> None:
+        """Note Tweet 应使用完整正文而不是带短链的顶层兼容文本。"""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = make_settings(Path(directory) / "state.db")
+            session = FakeSession(
+                [
+                    FakeResponse(
+                        {
+                            "data": [
+                                {
+                                    "id": "101",
+                                    "text": "被截断的正文 https://t.co/example",
+                                    "note_tweet": {
+                                        "text": "这是 Note Tweet 的完整正文"
+                                    },
+                                }
+                            ],
+                            "meta": {},
+                        }
+                    )
+                ]
+            )
+            posts = XClient(settings, session=session).fetch_posts("100")
+
+        self.assertEqual(posts[0].text, "这是 Note Tweet 的完整正文")
+        self.assertIn("note_tweet", session.calls[0][2]["params"]["tweet.fields"])
+
     def test_feishu_client_sends_interactive_card(self) -> None:
         """飞书卡片应使用 interactive 消息类型。"""
         with tempfile.TemporaryDirectory() as directory:
@@ -230,7 +257,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(session.calls[0][2]["params"]["max_results"], 5)
 
     def test_x_client_can_include_user_replies(self) -> None:
-        """启用回复后不应向 X API 传递 replies 排除项。"""
+        """启用回复后应在同一响应中解析被回复推文和作者。"""
         with tempfile.TemporaryDirectory() as directory:
             settings = make_settings(
                 Path(directory) / "state.db", {"X_INCLUDE_REPLIES": "true"}
@@ -238,14 +265,51 @@ class ClientTests(unittest.TestCase):
             session = FakeSession(
                 [
                     FakeResponse(
-                        {"data": [{"id": "101", "text": "回复内容"}], "meta": {}}
+                        {
+                            "data": [
+                                {
+                                    "id": "101",
+                                    "text": "被截断的回复",
+                                    "note_tweet": {"text": "完整回复内容"},
+                                    "in_reply_to_user_id": "900",
+                                    "referenced_tweets": [
+                                        {"type": "replied_to", "id": "88"}
+                                    ],
+                                }
+                            ],
+                            "includes": {
+                                "tweets": [
+                                    {
+                                        "id": "88",
+                                        "text": "被截断的原推文",
+                                        "note_tweet": {"text": "被回复推文的完整内容"},
+                                        "author_id": "900",
+                                    }
+                                ],
+                                "users": [
+                                    {
+                                        "id": "900",
+                                        "username": "original_author",
+                                        "name": "Original Author",
+                                    }
+                                ],
+                            },
+                            "meta": {},
+                        }
                     )
                 ]
             )
             posts = XClient(settings, session=session).fetch_posts("100")
 
         self.assertEqual([post.id for post in posts], ["101"])
+        self.assertEqual(posts[0].text, "完整回复内容")
+        self.assertEqual(posts[0].reply_to_post_id, "88")
+        self.assertEqual(posts[0].reply_to_text, "被回复推文的完整内容")
+        self.assertEqual(posts[0].reply_to_username, "original_author")
         self.assertEqual(session.calls[0][2]["params"]["exclude"], "retweets")
+        self.assertIn(
+            "referenced_tweets.id", session.calls[0][2]["params"]["expansions"]
+        )
 
 
 class ServiceTests(unittest.TestCase):
@@ -312,6 +376,32 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("X 更新", card_text)
         self.assertIn("@example_user", card_text)
         self.assertIn("中文译文", card_text)
+        self.assertIn("https://x.com/example_user/status/123", card_text)
+
+    def test_reply_card_contains_context_and_both_links(self) -> None:
+        """回复卡片应展示被回复内容并提供两条原文链接。"""
+        with tempfile.TemporaryDirectory() as directory:
+            settings = make_settings(Path(directory) / "state.db")
+            card = build_post_card(
+                Post(
+                    id="123",
+                    text="这是回复内容",
+                    created_at="2026-07-13T02:33:19Z",
+                    reply_to_post_id="88",
+                    reply_to_text="这是被回复的推文",
+                    reply_to_username="original_author",
+                    reply_to_name="Original Author",
+                ),
+                settings,
+                translation="This is the translated reply",
+            )
+
+        card_text = str(card)
+        self.assertIn("@example_user 回复了 @original_author", card_text)
+        self.assertIn("被回复的推文", card_text)
+        self.assertIn("这是回复内容", card_text)
+        self.assertIn("This is the translated reply", card_text)
+        self.assertIn("https://x.com/original_author/status/88", card_text)
         self.assertIn("https://x.com/example_user/status/123", card_text)
 
     def test_translation_failure_still_pushes_original_and_advances_cursor(

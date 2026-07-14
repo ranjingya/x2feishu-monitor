@@ -79,10 +79,20 @@ class XClient:
         posts_by_id: dict[str, Post] = {}
 
         for page_number in range(1, page_limit + 1):
+            tweet_fields = ["created_at", "author_id", "note_tweet"]
+            if self.settings.include_replies:
+                tweet_fields.extend(["referenced_tweets", "in_reply_to_user_id"])
             params: dict[str, str | int] = {
                 "max_results": page_size,
-                "tweet.fields": "created_at,author_id",
+                "tweet.fields": ",".join(tweet_fields),
             }
+            if self.settings.include_replies:
+                params["expansions"] = (
+                    "referenced_tweets.id,"
+                    "referenced_tweets.id.author_id,"
+                    "in_reply_to_user_id"
+                )
+                params["user.fields"] = "username,name"
             excluded_types: list[str] = []
             if not self.settings.include_replies:
                 excluded_types.append("replies")
@@ -99,11 +109,29 @@ class XClient:
             raw_posts = payload.get("data") or []
             if not isinstance(raw_posts, list):
                 raise ExternalServiceError("X API 返回的 data 字段格式不正确")
+
+            included_posts: dict[str, dict[str, Any]] = {}
+            included_users: dict[str, dict[str, Any]] = {}
+            includes = payload.get("includes") or {}
+            if isinstance(includes, dict):
+                for included_post in includes.get("tweets") or []:
+                    if not isinstance(included_post, dict):
+                        continue
+                    included_post_id = str(included_post.get("id", "")).strip()
+                    if included_post_id.isdigit():
+                        included_posts[included_post_id] = included_post
+                for included_user in includes.get("users") or []:
+                    if not isinstance(included_user, dict):
+                        continue
+                    included_user_id = str(included_user.get("id", "")).strip()
+                    if included_user_id.isdigit():
+                        included_users[included_user_id] = included_user
+
             for raw_post in raw_posts:
                 if not isinstance(raw_post, dict):
                     LOGGER.warning("忽略格式异常的帖子数据")
                     continue
-                post = Post.from_api(raw_post)
+                post = Post.from_api(raw_post, included_posts, included_users)
                 posts_by_id[post.id] = post
 
             meta = payload.get("meta") or {}
