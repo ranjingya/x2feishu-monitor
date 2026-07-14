@@ -1,5 +1,6 @@
 services:
   monitor:
+    image: x2feishu-monitor:latest
     container_name: x2feishu-monitor
     build:
       context: .
