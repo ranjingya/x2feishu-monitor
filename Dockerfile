@@ -2,6 +2,8 @@ FROM python:3.13-slim-bookworm
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.1 /uv /uvx /bin/
 
+ENV TZ=Asia/Shanghai
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
